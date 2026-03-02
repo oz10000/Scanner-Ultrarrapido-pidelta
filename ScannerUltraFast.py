@@ -11,11 +11,27 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # CONFIGURACIÓN
 # ============================================================
 TIMEFRAMES = ["1m", "3m", "5m"]
+# Mapeo a formato KuCoin
+KUCOIN_TF_MAP = {
+    "1m": "1min",
+    "3m": "3min",
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1h": "1hour",
+    "2h": "2hour",
+    "4h": "4hour",
+    "6h": "6hour",
+    "8h": "8hour",
+    "12h": "12hour",
+    "1d": "1day",
+    "1w": "1week"
+}
 LOOKBACK_CANDLES = 200
 BASE_SYMBOLS = ["BTC", "ETH", "SOL"]
-ASSETS = ["BTC", "ETH", "SOL"]  # Puedes agregar más (ej: "BNB", "ADA")
-DEVIATION_THRESHOLD = 0.003  # 0.3% desviación
-LOOKAHEAD = 20  # Velas futuras para medir corrección
+ASSETS = ["BTC", "ETH", "SOL"]
+DEVIATION_THRESHOLD = 0.003
+LOOKAHEAD = 20
 OUTPUT_FILE = "backtest_escaneo.txt"
 MAX_WORKERS = 5
 
@@ -26,17 +42,19 @@ DATA_CACHE = {}
 # FUNCIONES DE DATOS (KuCoin con caché)
 # ============================================================
 def fetch_kucoin_candles(symbol, interval, limit=200):
-    """
-    Descarga velas de KuCoin y las guarda en caché.
-    Retorna DataFrame con columnas: open, high, low, close, volume.
-    """
     cache_key = f"{symbol}_{interval}"
     if cache_key in DATA_CACHE:
         return DATA_CACHE[cache_key]
 
-    url = f"https://api.kucoin.com/api/v1/market/candles"
+    # Convertir intervalo a formato KuCoin
+    kucoin_tf = KUCOIN_TF_MAP.get(interval)
+    if not kucoin_tf:
+        print(f"   ⚠️ Intervalo {interval} no soportado por KuCoin")
+        return None
+
+    url = "https://api.kucoin.com/api/v1/market/candles"
     params = {
-        'type': interval,
+        'type': kucoin_tf,
         'symbol': f"{symbol}-USDT",
         'limit': limit
     }
@@ -47,7 +65,7 @@ def fetch_kucoin_candles(symbol, interval, limit=200):
             return None
         data = r.json()
         if data.get('code') != '200000':
-            print(f"   ⚠️ KuCoin {symbol} {interval} - error {data.get('code')}")
+            print(f"   ⚠️ KuCoin {symbol} {interval} - error {data.get('code')}: {data.get('msg')}")
             return None
         candles = data.get('data')
         if not candles or len(candles) == 0:
@@ -83,10 +101,6 @@ def compute_corr(pid1, pid2):
     return 0
 
 def time_to_correction(price, idx, threshold, max_lookahead=20):
-    """
-    Calcula cuántas velas tarda el precio en moverse al menos un threshold (porcentaje)
-    desde el punto idx.
-    """
     base = price.iloc[idx]
     target_up = base * (1 + threshold)
     target_down = base * (1 - threshold)
