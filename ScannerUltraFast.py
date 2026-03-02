@@ -13,35 +13,47 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 TIMEFRAMES = ["1m", "3m", "5m"]
 LOOKBACK_CANDLES = 200
 BASE_SYMBOLS = ["BTC", "ETH", "SOL"]
-ASSETS = ["BTC", "ETH", "SOL"]  # Se pueden agregar más
-DEVIATION_THRESHOLD = 0.003  # 0.3% desviación para detectar eventos
+ASSETS = ["BTC", "ETH", "SOL"]  # Puedes agregar más (ej: "BNB", "ADA")
+DEVIATION_THRESHOLD = 0.003  # 0.3% desviación
 LOOKAHEAD = 20  # Velas futuras para medir corrección
 OUTPUT_FILE = "backtest_escaneo.txt"
-MAX_WORKERS = 5  # Número de workers para descargas paralelas
+MAX_WORKERS = 5
 
 HEADERS = {'User-Agent': 'Mozilla/5.0'}
-DATA_CACHE = {}  # Caché global: clave = f"{symbol}_{timeframe}"
+DATA_CACHE = {}
 
 # ============================================================
 # FUNCIONES DE DATOS (KuCoin con caché)
 # ============================================================
 def fetch_kucoin_candles(symbol, interval, limit=200):
     """
-    Devuelve DataFrame con columnas: timestamp, open, high, low, close, volume
-    Utiliza caché para evitar descargas repetidas.
+    Descarga velas de KuCoin y las guarda en caché.
+    Retorna DataFrame con columnas: open, high, low, close, volume.
     """
     cache_key = f"{symbol}_{interval}"
     if cache_key in DATA_CACHE:
         return DATA_CACHE[cache_key]
 
-    url = f"https://api.kucoin.com/api/v1/market/candles?type={interval}&symbol={symbol}-USDT&limit={limit}"
+    url = f"https://api.kucoin.com/api/v1/market/candles"
+    params = {
+        'type': interval,
+        'symbol': f"{symbol}-USDT",
+        'limit': limit
+    }
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        data = r.json()
-        if r.status_code != 200 or not data.get('data'):
-            print(f"   ⚠️ KuCoin {symbol} {interval}: sin datos")
+        r = requests.get(url, params=params, headers=HEADERS, timeout=15)
+        if r.status_code != 200:
+            print(f"   ⚠️ KuCoin {symbol} {interval} - HTTP {r.status_code}")
             return None
-        df = pd.DataFrame(data['data'], columns=['time', 'open', 'close', 'high', 'low', 'volume', 'turnover'])
+        data = r.json()
+        if data.get('code') != '200000':
+            print(f"   ⚠️ KuCoin {symbol} {interval} - error {data.get('code')}")
+            return None
+        candles = data.get('data')
+        if not candles or len(candles) == 0:
+            print(f"   ⚠️ KuCoin {symbol} {interval} - sin datos")
+            return None
+        df = pd.DataFrame(candles, columns=['time', 'open', 'close', 'high', 'low', 'volume', 'turnover'])
         df['timestamp'] = pd.to_datetime(df['time'].astype(float), unit='s')
         df[['open','high','low','close','volume']] = df[['open','high','low','close','volume']].astype(float)
         df = df[['timestamp','open','high','low','close','volume']].sort_values('timestamp')
@@ -50,11 +62,11 @@ def fetch_kucoin_candles(symbol, interval, limit=200):
         print(f"   📥 KuCoin {symbol} {interval}: {len(df)} velas")
         return df
     except Exception as e:
-        print(f"   ❌ Error KuCoin {symbol}-{interval}: {e}")
+        print(f"   ❌ Excepción KuCoin {symbol}-{interval}: {e}")
         return None
 
 # ============================================================
-# CÁLCULO DE MÉTRICAS
+# MÉTRICAS
 # ============================================================
 def compute_ema(series, span):
     return series.ewm(span=span, adjust=False).mean()
@@ -86,17 +98,8 @@ def time_to_correction(price, idx, threshold, max_lookahead=20):
             return i
     return np.nan
 
-def compute_edge(price, idx, threshold, max_lookahead=20):
-    """
-    Edge: proporción de veces que en el pasado, una desviación similar fue seguida
-    de una corrección (retorno hacia la media). Simplificado: miramos si el precio
-    vuelve a cruzar la EMA20 en las siguientes velas.
-    """
-    # No implementado completamente; por ahora retornamos NaN
-    return np.nan
-
 # ============================================================
-# ANÁLISIS POR SÍMBOLO/TIMEFRAME (con pre-cálculo de indicadores)
+# ANÁLISIS POR SÍMBOLO/TIMEFRAME
 # ============================================================
 def analyze_symbol_tf(symbol, tf):
     df = fetch_kucoin_candles(symbol, tf, limit=LOOKBACK_CANDLES)
@@ -104,14 +107,11 @@ def analyze_symbol_tf(symbol, tf):
         return []
 
     price = df['close']
-    ema_fast = compute_ema(price, span=5)
     ema_slow = compute_ema(price, span=20)
     deviation = (price - ema_slow) / ema_slow
     pidelta = compute_pidelta(price)
 
-    # Precalcular correlaciones con otros símbolos (para cada punto sería costoso,
-    # así que lo haremos a nivel de serie completa y luego asignaremos el mismo valor
-    # a todos los eventos de este símbolo/tf, lo cual es una simplificación aceptable).
+    # Calcular correlaciones con otros símbolos base (una sola vez)
     corr_values = {}
     for base in BASE_SYMBOLS:
         if base == symbol:
@@ -129,13 +129,11 @@ def analyze_symbol_tf(symbol, tf):
     for idx in range(len(price)):
         if abs(deviation.iloc[idx]) > DEVIATION_THRESHOLD:
             tau = time_to_correction(price, idx, DEVIATION_THRESHOLD, LOOKAHEAD)
-            # edge = compute_edge(price, idx, DEVIATION_THRESHOLD, LOOKAHEAD)  # pendiente
             events.append({
                 "Timestamp": df.index[idx],
                 "Symbol": symbol,
                 "TF": tf,
                 "Deviation": deviation.iloc[idx],
-                "Edge": np.nan,  # placeholder
                 "Tau": tau,
                 **corr_values
             })
@@ -161,10 +159,9 @@ def scan_all():
 
     if not all_events:
         print("❌ No se detectaron eventos.")
-        return
+        return pd.DataFrame()
 
     df_events = pd.DataFrame(all_events)
-    # Ordenar por timestamp (más reciente primero)
     df_events = df_events.sort_values('Timestamp', ascending=False)
     df_events.to_csv(OUTPUT_FILE, sep='\t', index=False)
     print(f"\n✅ Escaneo completado. Archivo generado: {OUTPUT_FILE}")
@@ -174,7 +171,7 @@ def scan_all():
     top_events = df_events.sort_values('AbsDeviation', ascending=False).head(10)
 
     # ========================================================
-    # INFORME ASCII EN CONSOLA
+    # INFORME ASCII
     # ========================================================
     print("\n" + "="*80)
     print("🚀 INFORME ULTRA RÁPIDO - SCALPING")
@@ -191,7 +188,7 @@ def scan_all():
         print("\n🔥 TOP 10 EVENTOS CON MAYOR DESVIACIÓN")
         print(top_events[['Timestamp','Symbol','TF','Deviation','Tau','Corr_BTC','Corr_ETH','Corr_SOL']].to_string(index=False))
 
-    # Recomendaciones simples basadas en Tau y correlación
+    # Recomendaciones
     print("\n📋 RECOMENDACIONES")
     print("-"*40)
     for _, row in top_events.iterrows():
@@ -225,6 +222,7 @@ def scan_all():
 
     print("\n✅ Fin del informe.")
     print("="*80)
+    return df_events
 
 # ============================================================
 # MAIN
@@ -233,4 +231,12 @@ if __name__ == "__main__":
     print("="*80)
     print("🚀 SCANNER ULTRA RÁPIDO BACKTEST (200 velas KuCoin) - VERSIÓN OPTIMIZADA")
     print("="*80)
-    scan_all()
+    df = scan_all()
+    if df.empty:
+        # Crear archivo vacío para evitar error de artifact
+        pd.DataFrame(columns=['Timestamp','Symbol','TF','Deviation','Tau',
+                              'Corr_BTC','Corr_ETH','Corr_SOL','AbsDeviation'])\
+          .to_csv(OUTPUT_FILE, sep='\t', index=False)
+        print("⚠️ No se generaron datos. Archivo vacío creado.")
+    else:
+        print(f"\n✅ Proceso completado. Revisa '{OUTPUT_FILE}'.")
